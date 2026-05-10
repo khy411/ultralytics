@@ -2495,3 +2495,74 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+class GatedConvAttnBlock(nn.Module):
+    """Lightweight gated block: dual depthwise conv + pooling attention + learnable gate."""
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Conv2d(c1, c2, 1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True)
+        ) if c1 != c2 else nn.Identity()
+        self.dw3 = nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False)
+        self.dw5 = nn.Conv2d(c2, c2, 5, padding=2, groups=c2, bias=False)
+        self.bn_dw = nn.BatchNorm2d(c2)
+        self.pw1 = nn.Conv2d(c2, c2 * 2, 1, bias=False)
+        self.act = nn.GELU()
+        self.pw2 = nn.Conv2d(c2 * 2, c2, 1, bias=False)
+        self.bn_pw = nn.BatchNorm2d(c2)
+        self.pool_attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d(4),
+            nn.Conv2d(c2, c2 // 4, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c2 // 4, c2, 1, bias=False),
+            nn.Sigmoid()
+        )
+        self.gate = nn.Parameter(torch.ones(1, c2, 1, 1) * 0.5)
+        self.bn_out = nn.BatchNorm2d(c2)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        conv = self.bn_dw(self.dw3(x) + self.dw5(x))
+        conv = self.bn_pw(self.pw2(self.act(self.pw1(conv))))
+        conv_delta = conv - x
+        attn_weight = torch.nn.functional.interpolate(
+            self.pool_attn(x), size=x.shape[2:], mode='bilinear', align_corners=False
+        )
+        attn_delta = x * attn_weight - x
+        alpha = torch.sigmoid(self.gate)
+        out = x + alpha * conv_delta + (1 - alpha) * attn_delta
+        return self.relu(self.bn_out(out))
+
+
+class CustomDetBackbone(nn.Module):
+    def __init__(self, c1: int, c2: int = 512, out_channels=(128, 256, 512)):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(c1, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.stage1 = GatedConvAttnBlock(32, 64)
+        self.down1  = nn.MaxPool2d(2)
+        self.stage2 = GatedConvAttnBlock(64, 128)
+        self.down2  = nn.MaxPool2d(2)
+        self.stage3 = GatedConvAttnBlock(128, 256)
+        self.down3  = nn.MaxPool2d(2)
+        self.stage4 = GatedConvAttnBlock(256, 512)
+        self.p3_proj = nn.Conv2d(128, out_channels[0], kernel_size=1)
+        self.p4_proj = nn.Conv2d(256, out_channels[1], kernel_size=1)
+        self.p5_proj = nn.Conv2d(512, out_channels[2], kernel_size=1)
+        self.c2 = c2
+
+    def forward(self, x):
+        x  = self.stem(x)
+        x  = self.stage1(x)
+        x  = self.down1(x)
+        p3 = self.stage2(x)
+        x  = self.down2(p3)
+        p4 = self.stage3(x)
+        x  = self.down3(p4)
+        p5 = self.stage4(x)
+        return [self.p3_proj(p3), self.p4_proj(p4), self.p5_proj(p5)]
