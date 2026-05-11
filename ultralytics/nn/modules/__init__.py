@@ -27,6 +27,8 @@ from .custom_blocks import (
 from .block import (
     GatedConvAttnBlock,
     CustomDetBackbone,
+    StridedDW,
+    DualStem,
     C1,
     C2,
     C2PSA,
@@ -230,4 +232,6 @@ __all__ = (
     "v10Detect",
     "GatedConvAttnBlock",
     "CustomDetBackbone",
+    "StridedDW",
+    "DualStem",
 )

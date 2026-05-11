@@ -2496,21 +2496,28 @@ class RealNVP(nn.Module):
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
 class GatedConvAttnBlock(nn.Module):
-    """Lightweight gated block: dual depthwise conv + pooling attention + learnable gate."""
-    def __init__(self, c1, c2):
+    """Gated block with dual depthwise conv + pooling attention + learnable gate."""
+    def __init__(self, c1, c2, bottleneck=False):
         super().__init__()
+        mid = c2 * 2 if bottleneck else c2
         self.input_proj = nn.Sequential(
             nn.Conv2d(c1, c2, 1, bias=False),
             nn.BatchNorm2d(c2),
             nn.ReLU(inplace=True)
         ) if c1 != c2 else nn.Identity()
+
+        # dual scale depthwise
         self.dw3 = nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False)
-        self.dw5 = nn.Conv2d(c2, c2, 5, padding=2, groups=c2, bias=False)
+        self.dw7 = nn.Conv2d(c2, c2, 7, padding=3, groups=c2, bias=False)
         self.bn_dw = nn.BatchNorm2d(c2)
-        self.pw1 = nn.Conv2d(c2, c2 * 2, 1, bias=False)
+
+        # bottleneck pointwise ffn
+        self.pw1 = nn.Conv2d(c2, mid, 1, bias=False)
         self.act = nn.GELU()
-        self.pw2 = nn.Conv2d(c2 * 2, c2, 1, bias=False)
+        self.pw2 = nn.Conv2d(mid, c2, 1, bias=False)
         self.bn_pw = nn.BatchNorm2d(c2)
+
+        # pooling attention
         self.pool_attn = nn.Sequential(
             nn.AdaptiveAvgPool2d(4),
             nn.Conv2d(c2, c2 // 4, 1, bias=False),
@@ -2518,13 +2525,15 @@ class GatedConvAttnBlock(nn.Module):
             nn.Conv2d(c2 // 4, c2, 1, bias=False),
             nn.Sigmoid()
         )
+
+        # learnable per-channel gate
         self.gate = nn.Parameter(torch.ones(1, c2, 1, 1) * 0.5)
         self.bn_out = nn.BatchNorm2d(c2)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         x = self.input_proj(x)
-        conv = self.bn_dw(self.dw3(x) + self.dw5(x))
+        conv = self.bn_dw(self.dw3(x) + self.dw7(x))
         conv = self.bn_pw(self.pw2(self.act(self.pw1(conv))))
         conv_delta = conv - x
         attn_weight = torch.nn.functional.interpolate(
@@ -2536,25 +2545,93 @@ class GatedConvAttnBlock(nn.Module):
         return self.relu(self.bn_out(out))
 
 
-class CustomDetBackbone(nn.Module):
-    def __init__(self, c1: int, c2: int = 512, out_channels=(128, 256, 512)):
+class StridedDW(nn.Module):
+    """Learned depthwise strided downsampling - better than MaxPool."""
+    def __init__(self, c):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(c1, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
+        self.dw = nn.Conv2d(c, c, 3, stride=2, padding=1, groups=c, bias=False)
+        self.pw = nn.Conv2d(c, c, 1, bias=False)
+        self.bn = nn.BatchNorm2d(c)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.bn(self.pw(self.dw(x))))
+
+
+class DualStem(nn.Module):
+    """Parallel 3x3 + 7x7 stem - captures fine and coarse early features simultaneously."""
+    def __init__(self, c1, c_out=64):
+        super().__init__()
+        mid = c_out // 2
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(c1, mid, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True)
         )
-        self.stage1 = GatedConvAttnBlock(32, 64)
-        self.down1  = nn.MaxPool2d(2)
-        self.stage2 = GatedConvAttnBlock(64, 128)
-        self.down2  = nn.MaxPool2d(2)
-        self.stage3 = GatedConvAttnBlock(128, 256)
-        self.down3  = nn.MaxPool2d(2)
-        self.stage4 = GatedConvAttnBlock(256, 512)
-        self.p3_proj = nn.Conv2d(128, out_channels[0], kernel_size=1)
-        self.p4_proj = nn.Conv2d(256, out_channels[1], kernel_size=1)
-        self.p5_proj = nn.Conv2d(512, out_channels[2], kernel_size=1)
+        self.branch7 = nn.Sequential(
+            nn.Conv2d(c1, mid, 7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True)
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(c_out, c_out, 1, bias=False),
+            nn.BatchNorm2d(c_out),
+            nn.ReLU(inplace=True)
+        )
+        self.pool = nn.MaxPool2d(3, stride=2, padding=1)
+
+    def forward(self, x):
+        x = torch.cat([self.branch3(x), self.branch7(x)], dim=1)
+        x = self.fuse(x)
+        return self.pool(x)
+
+
+class CustomDetBackbone(nn.Module):
+    def __init__(self, c1: int, c2: int = 1024, out_channels=(256, 512, 1024)):
+        super().__init__()
+        # dual-scale stem: parallel 3x3 + 7x7
+        self.stem = DualStem(c1, 64)
+
+        # 2 blocks per stage, second block uses bottleneck
+        self.stage1 = nn.Sequential(
+            GatedConvAttnBlock(64, 128),
+            GatedConvAttnBlock(128, 128, bottleneck=True)
+        )
+        self.down1 = StridedDW(128)
+
+        self.stage2 = nn.Sequential(
+            GatedConvAttnBlock(128, 256),
+            GatedConvAttnBlock(256, 256, bottleneck=True)
+        )
+        self.down2 = StridedDW(256)
+
+        self.stage3 = nn.Sequential(
+            GatedConvAttnBlock(256, 512),
+            GatedConvAttnBlock(512, 512, bottleneck=True)
+        )
+        self.down3 = StridedDW(512)
+
+        self.stage4 = nn.Sequential(
+            GatedConvAttnBlock(512, 1024),
+            GatedConvAttnBlock(1024, 1024, bottleneck=True)
+        )
+
+        self.p3_proj = nn.Conv2d(256,  out_channels[0], kernel_size=1)
+        self.p4_proj = nn.Conv2d(512,  out_channels[1], kernel_size=1)
+        self.p5_proj = nn.Conv2d(1024, out_channels[2], kernel_size=1)
         self.c2 = c2
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
 
     def forward(self, x):
         x  = self.stem(x)
